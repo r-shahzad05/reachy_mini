@@ -13,12 +13,15 @@ still receives broadcast messages.
 """
 
 import asyncio
+import time
+from threading import Thread
 from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import WebSocket, WebSocketDisconnect
 
+from reachy_mini.daemon.daemon import Daemon
 from reachy_mini.io.protocol import DaemonState, DaemonStatus
 from reachy_mini.io.ws_server import WSServer
 
@@ -114,50 +117,53 @@ async def test_broadcast_before_any_client_is_noop() -> None:
     server._broadcast('{"type": "status"}')  # must not raise
 
 
-async def _wait_sent(ws: FakeWebSocket, count: int) -> None:
-    async with asyncio.timeout(2):
-        while len(ws.sent) < count:
-            await asyncio.sleep(0.01)
-
-
 @pytest.mark.asyncio
-async def test_new_client_receives_status_on_connect() -> None:
-    """A new client gets the current status without waiting for the 1 Hz tick."""
-    server = WSServer(backend=MagicMock(), status_provider=lambda: STATUS)
+async def test_new_client_receives_status_without_waiting_for_tick() -> None:
+    """The status thread wakes on connect and sends a status read after it.
+
+    It used to sleep 1 s between publishes, so ReachyMini() waited up to 1 s
+    for its first status during media setup.
+    """
+    server = WSServer(backend=MagicMock())
+    daemon = Daemon(no_media=True)
+    daemon.ws_server = server
+    reads: list[float] = []
+
+    def status() -> DaemonStatus:
+        reads.append(time.monotonic())
+        return STATUS.model_copy(update={"robot_name": str(len(reads) - 1)})
 
     ws = FakeWebSocket()
-    client_task = asyncio.create_task(server.handle_client(cast(WebSocket, ws)))
-    await _wait_sent(ws, 1)
+    accepted_at = 0.0
 
-    assert ws.sent == [STATUS.model_dump_json()]
+    async def accept() -> None:
+        nonlocal accepted_at
+        accepted_at = time.monotonic()
+
+    def read_after_accept() -> bool:
+        return any(
+            reads[int(DaemonStatus.model_validate_json(msg).robot_name)] >= accepted_at
+            for msg in ws.sent
+        )
+
+    with patch.object(daemon, "status", side_effect=status):
+        thread = Thread(target=daemon._publish_status, daemon=True)
+        thread.start()
+        async with asyncio.timeout(2):
+            while not reads:  # first tick, no client yet
+                await asyncio.sleep(0.01)
+
+        with patch.object(ws, "accept", side_effect=accept):
+            client_task = asyncio.create_task(server.handle_client(cast(WebSocket, ws)))
+            # The first tick may still land after registration; what matters
+            # is a status read after connect, well before the next 1 s tick.
+            async with asyncio.timeout(0.5):
+                while not read_after_accept():
+                    await asyncio.sleep(0.01)
+
+        daemon._thread_event_publish_status.set()
+        server.client_connected_event().set()
+        thread.join(timeout=2)
 
     ws.disconnect()
     await client_task
-
-
-@pytest.mark.asyncio
-async def test_new_client_skips_broadcast_queued_before_it_connected() -> None:
-    """A broadcast scheduled before registration must not follow the fresh status."""
-    server = WSServer(backend=MagicMock(), status_provider=lambda: STATUS)
-    stale = STATUS.model_copy(update={"state": DaemonState.STARTING})
-
-    first = FakeWebSocket()  # captures the loop so _broadcast schedules
-    first_task = asyncio.create_task(server.handle_client(cast(WebSocket, first)))
-    await _wait_sent(first, 1)
-
-    second = FakeWebSocket()
-    with patch.object(
-        second,
-        "accept",
-        side_effect=lambda: server.publish_status(stale.model_dump_json()),
-    ):
-        second_task = asyncio.create_task(server.handle_client(cast(WebSocket, second)))
-        await _wait_sent(first, 2)
-        await _wait_sent(second, 1)
-        await asyncio.sleep(0.05)
-
-    assert second.sent == [STATUS.model_dump_json()]
-
-    first.disconnect()
-    second.disconnect()
-    await asyncio.gather(first_task, second_task)
